@@ -4,8 +4,8 @@ Tuteur **Python débutant** : rôle `note`, prompt [`prompts/system.md`](prompts
 
 ## Rendu
 
-- **Backend (ce dépôt)** : [TresorAlad/bootcamp-chatbot-backend](https://github.com/TresorAlad/bootcamp-chatbot-backend)
-- **Frontend** : [TresorAlad/bootcamp-chatbot-frontend](https://github.com/TresorAlad/bootcamp-chatbot-frontend)
+- **Backend (ce dépôt)** : https://github.com/TresorAlad/bootcamp-chatbot-backend
+- **Frontend (dépôt compagnon)** : https://github.com/TresorAlad/bootcamp-chatbot-frontend
 
 > Ne jamais committer `.env` ni une clé API (`rd_sk_...`). Vérifier avec `git status` avant chaque push.
 
