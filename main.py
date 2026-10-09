@@ -1,30 +1,26 @@
-import os
 from datetime import datetime
 
-import httpx
-from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
-from pydantic import BaseModel
-from sqlalchemy import and_, select
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from chat_service import persist_note, stream_chat_reply
+from config import NOTE_ROLE, get_allowed_models, get_default_model, validate_model
+from conversation import build_llm_history, conversation_preview, list_conversations_query, load_messages
 from database.db import get_db
 from database.models import Conversation, Message
 
-load_dotenv()
-
-RODIUMAI_URL = "https://api.rodiumai.io/v1/chat/completions"
-RODIUMAI_API_KEY = os.environ["RODIUMAI_API_KEY"]
-MODEL = os.getenv("RODIUMAI_MODEL", "anthropic/claude-sonnet-4-5-20250929")
-PREVIEW_LENGTH = 60
-
-SYSTEM_PROMPT = (
-    "Tu es Study Buddy, un tuteur bienveillant pour les étudiants."
-    "Réponds aux questions de manière claire et concise."
-)
-
 app = FastAPI(title="Study Buddy Chatbot")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class ConversationResponse(BaseModel):
@@ -34,16 +30,17 @@ class ConversationResponse(BaseModel):
 class ConversationSummary(BaseModel):
     id: int
     created_at: datetime
-    preview: str | None  # first user message, truncated; None while the conversation is empty
+    preview: str | None
 
 
 class ChatRequest(BaseModel):
     conversation_id: int
-    message: str
+    message: str = Field(min_length=1)
+    model: str = Field(min_length=1)
 
 
-class ChatResponse(BaseModel):
-    reply: str
+class NoteRequest(BaseModel):
+    content: str = Field(min_length=1)
 
 
 class MessageResponse(BaseModel):
@@ -53,15 +50,14 @@ class MessageResponse(BaseModel):
     created_at: datetime
 
 
-def load_messages(db: Session, conversation_id: int) -> list[Message]:
-    # A conversation's messages in order; 404 if the conversation doesn't exist.
-    if db.get(Conversation, conversation_id) is None:
-        raise HTTPException(status_code=404, detail="Conversation not found.")
-    return db.scalars(
-        select(Message)
-        .where(Message.conversation_id == conversation_id)
-        .order_by(Message.seq)
-    ).all()
+class ModelsResponse(BaseModel):
+    models: list[str]
+    default: str
+
+
+@app.get("/models", response_model=ModelsResponse)
+def list_models() -> ModelsResponse:
+    return ModelsResponse(models=get_allowed_models(), default=get_default_model())
 
 
 @app.post("/conversations", status_code=201)
@@ -74,17 +70,12 @@ def create_conversation(db: Session = Depends(get_db)) -> ConversationResponse:
 
 @app.get("/conversations")
 def list_conversations(db: Session = Depends(get_db)) -> list[ConversationSummary]:
-    # Newest first, each joined to its first message (seq 1, always the user's) for the preview.
-    rows = db.execute(
-        select(Conversation, Message.content)
-        .outerjoin(Message, and_(Message.conversation_id == Conversation.id, Message.seq == 1))
-        .order_by(Conversation.id.desc())
-    ).all()
+    rows = list_conversations_query(db)
     return [
         ConversationSummary(
             id=conversation.id,
             created_at=conversation.created_at,
-            preview=content[:PREVIEW_LENGTH] if content else None,
+            preview=conversation_preview(content),
         )
         for conversation, content in rows
     ]
@@ -98,47 +89,44 @@ def list_messages(conversation_id: int, db: Session = Depends(get_db)) -> list[M
     ]
 
 
-@app.post("/chat")
-def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
-    # Load this conversation from the database, in message order.
-    rows = load_messages(db, req.conversation_id)
-    history = [{"role": m.role, "content": m.content} for m in rows]
-    next_seq = rows[-1].seq + 1 if rows else 1
-    user_message = {"role": "user", "content": req.message}
-
-    # The LLM is stateless: resend the system prompt + the whole conversation each turn.
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, user_message]
-
+@app.post("/conversations/{conversation_id}/notes", status_code=201)
+def create_note(
+    conversation_id: int, req: NoteRequest, db: Session = Depends(get_db)
+) -> MessageResponse:
     try:
-        response = httpx.post(
-            RODIUMAI_URL,
-            headers={"Authorization": f"Bearer {RODIUMAI_API_KEY}"},
-            json={
-                "model": MODEL,
-                "messages": messages, 
-                "max_tokens": 512,
-                "stream": False,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="The LLM API call failed.") from exc
-
-    reply = response.json()["choices"][0]["message"]["content"]
-
-    # Only record the turn once the call succeeded, so a failure doesn't leave a dangling user message.
-    db.add_all([
-        Message(conversation_id=req.conversation_id, seq=next_seq, role="user", content=req.message),
-        Message(conversation_id=req.conversation_id, seq=next_seq + 1, role="assistant", content=reply),
-    ])
-    try:
-        db.commit()
+        note = persist_note(db, conversation_id, req.content.strip())
     except IntegrityError:
-        # Another request already wrote these seq numbers in this conversation while we waited for the LLM.
         db.rollback()
         raise HTTPException(
-            status_code=409, detail="The conversation was updated concurrently, please retry."
-        )
-    print(history)
-    return ChatResponse(reply=reply)
+            status_code=409, detail="La conversation a été modifiée en parallèle, réessayez."
+        ) from None
+    return MessageResponse(
+        seq=note.seq, role=note.role, content=note.content, created_at=note.created_at
+    )
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
+    try:
+        validate_model(req.model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return StreamingResponse(
+        stream_chat_reply(
+            conversation_id=req.conversation_id,
+            message=req.message.strip(),
+            model=req.model,
+            request=request,
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+__all__ = ["app", "build_llm_history", "NOTE_ROLE"]
